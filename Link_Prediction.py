@@ -9,19 +9,22 @@ import torch
 
 from dymlh_link.data import load_dynamic_link_data, move_snapshots_to_device, sample_negative_edges
 from dymlh_link.metrics import compute_metrics, link_loss
-from dymlh_link.model import DynamicHomogeneousLinkPredictor
+from dymlh_link.model import DynamicMultilayerLinkPredictor
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Snapshot-based dynamic homogeneous link prediction.")
-    parser.add_argument("--snapshot-bins", type=str, required=True, help="Comma-separated historical DGL .bin snapshots, e.g. 2015.bin,2016.bin,...,2019.bin.")
-    parser.add_argument("--target-bin", type=str, required=True, help="Prediction target DGL .bin graph, e.g. 2020.bin. Edge masks must be stored here.")
-    parser.add_argument("--graph-index", type=int, default=0, help="Graph index for each historical snapshot bin.")
-    parser.add_argument("--target-graph-index", type=int, default=0, help="Graph index for the target bin.")
+    parser = argparse.ArgumentParser(description="Snapshot-based dynamic multilayer target-layer link prediction.")
+    parser.add_argument("--snapshot-bins", type=str, required=True, help="Comma-separated historical DGL .bin snapshots.")
+    parser.add_argument("--target-bin", type=str, required=True, help="Prediction target DGL .bin graph. Edge masks must be stored on the target layer here.")
+    parser.add_argument("--target-layer", type=str, required=True, help="Target layer/relation, e.g. layer_0 or node:layer_0:node.")
+    parser.add_argument("--node-type", type=str, default=None, help="Node type used by the multilayer graph. Omit when the graph has one node type.")
+    parser.add_argument("--use-layers", type=str, default=None, help="Comma-separated layers used by the snapshot encoder. Default: all same-node layers.")
+    parser.add_argument("--graph-index", type=int, default=0)
+    parser.add_argument("--target-graph-index", type=int, default=0)
     parser.add_argument("--feat-key", type=str, default="feat")
     parser.add_argument("--global-id-key", type=str, default="global_id")
     parser.add_argument("--feature-fallback", type=str, default="degree", choices=["degree", "none"])
-    parser.add_argument("--undirected", action="store_true", default=False, help="Treat positive target edges as undirected during negative sampling.")
+    parser.add_argument("--undirected", action="store_true", default=False)
     parser.add_argument("--no-cuda", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=200)
@@ -30,6 +33,7 @@ def build_parser():
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--sage-aggregator-type", type=str, default="mean", choices=["mean", "pool", "lstm", "gcn"])
+    parser.add_argument("--layer-fusion", type=str, default="attention", choices=["mean", "attention", "weight", "cat"])
     parser.add_argument("--temporal-model", type=str, default="gru", choices=["gru", "lstm", "transformer", "attention"])
     parser.add_argument("--temporal-layers", type=int, default=1)
     parser.add_argument("--temporal-heads", type=int, default=4)
@@ -38,6 +42,7 @@ def build_parser():
     parser.add_argument("--predictor-hidden-dim", type=int, default=None)
     parser.add_argument("--negative-ratio", type=float, default=1.0)
     parser.add_argument("--eval-negative-ratio", type=float, default=1.0)
+    parser.add_argument("--negative-exclude-layers", type=str, default="target", choices=["target", "all"], help="Exclude positives from target layer only or all used layers when sampling negatives.")
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--early-stop-metric", type=str, default="auc", choices=["auc", "pr_auc", "f1"])
     parser.add_argument("--log-every", type=int, default=10)
@@ -47,31 +52,21 @@ def build_parser():
 
 
 def make_batch(pos_edges, data, ratio, device):
-    neg_edges = sample_negative_edges(
-        pos_edges,
-        data.num_global_nodes,
-        data.all_positive_edges,
-        negative_ratio=ratio,
-        undirected=data.undirected,
-        device=device,
-    )
+    neg_edges = sample_negative_edges(pos_edges, data.num_global_nodes, data.all_positive_edges, ratio, data.undirected, device)
     pos_edges = pos_edges.to(device)
     edges = torch.cat([pos_edges, neg_edges], dim=1)
-    labels = torch.cat([
-        torch.ones(pos_edges.shape[1], device=device),
-        torch.zeros(neg_edges.shape[1], device=device),
-    ])
+    labels = torch.cat([torch.ones(pos_edges.shape[1], device=device), torch.zeros(neg_edges.shape[1], device=device)])
     return edges, labels
 
 
 def run_split(model, snapshots, data, pos_edges, ratio, device, optimizer=None):
-    is_train = optimizer is not None
-    model.train(is_train)
+    train = optimizer is not None
+    model.train(train)
     edges, labels = make_batch(pos_edges, data, ratio, device)
-    with torch.set_grad_enabled(is_train):
+    with torch.set_grad_enabled(train):
         scores = model(snapshots, edges)
         loss = link_loss(scores, labels)
-        if is_train:
+        if train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -81,14 +76,7 @@ def run_split(model, snapshots, data, pos_edges, ratio, device, optimizer=None):
 
 
 def metric_line(epoch, split, metrics):
-    return {
-        "epoch": epoch,
-        "split": split,
-        "loss": metrics["loss"],
-        "auc": metrics["auc"],
-        "pr_auc": metrics["pr_auc"],
-        "f1": metrics["f1"],
-    }
+    return {"epoch": epoch, "split": split, "loss": metrics["loss"], "auc": metrics["auc"], "pr_auc": metrics["pr_auc"], "f1": metrics["f1"]}
 
 
 def save_outputs(args, records, best_valid, test_metrics):
@@ -113,12 +101,15 @@ def main():
 
     data = load_dynamic_link_data(args)
     snapshots = move_snapshots_to_device(data.snapshots, device)
-    model = DynamicHomogeneousLinkPredictor(
+    model = DynamicMultilayerLinkPredictor(
         input_dim=data.input_dim,
         hidden_dim=args.hidden_dim,
         num_global_nodes=data.num_global_nodes,
+        layer_etypes=data.layer_etypes,
+        node_type=data.node_type,
         gnn_layers=args.gnn_layers,
         sage_aggregator_type=args.sage_aggregator_type,
+        layer_fusion=args.layer_fusion,
         temporal_model=args.temporal_model,
         temporal_layers=args.temporal_layers,
         temporal_heads=args.temporal_heads,
@@ -130,11 +121,12 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     print("Historical snapshots: {}".format(len(snapshots)))
-    print("Target graph edges use train/valid/test masks from: {}".format(args.target_bin))
+    print("Target graph: {}".format(args.target_bin))
+    print("Node type: {}".format(data.node_type))
+    print("Target layer: {}".format(data.target_etype))
+    print("Message layers: {}".format(data.layer_etypes))
     print("Global nodes: {}".format(data.num_global_nodes))
-    print("Train/valid/test positives: {}/{}/{}".format(
-        data.train_pos_edges.shape[1], data.valid_pos_edges.shape[1], data.test_pos_edges.shape[1]
-    ))
+    print("Train/valid/test positives: {}/{}/{}".format(data.train_pos_edges.shape[1], data.valid_pos_edges.shape[1], data.test_pos_edges.shape[1]))
     print("Temporal model: {}".format(args.temporal_model))
 
     records = []
@@ -146,12 +138,7 @@ def main():
         train_metrics = run_split(model, snapshots, data, data.train_pos_edges, args.negative_ratio, device, optimizer)
         valid_metrics = run_split(model, snapshots, data, data.valid_pos_edges, args.eval_negative_ratio, device)
         test_metrics = run_split(model, snapshots, data, data.test_pos_edges, args.eval_negative_ratio, device)
-        records.extend([
-            metric_line(epoch, "train", train_metrics),
-            metric_line(epoch, "valid", valid_metrics),
-            metric_line(epoch, "test", test_metrics),
-        ])
-
+        records.extend([metric_line(epoch, "train", train_metrics), metric_line(epoch, "valid", valid_metrics), metric_line(epoch, "test", test_metrics)])
         score = valid_metrics[args.early_stop_metric]
         if score > best_score:
             best_score = score
@@ -160,20 +147,8 @@ def main():
             bad_epochs = 0
         else:
             bad_epochs += 1
-
         if epoch == 1 or epoch % args.log_every == 0:
-            print(
-                "Epoch {:04d} | train loss {:.4f} auc {:.4f} | valid loss {:.4f} auc {:.4f} pr_auc {:.4f} f1 {:.4f} | test auc {:.4f}".format(
-                    epoch,
-                    train_metrics["loss"],
-                    train_metrics["auc"],
-                    valid_metrics["loss"],
-                    valid_metrics["auc"],
-                    valid_metrics["pr_auc"],
-                    valid_metrics["f1"],
-                    test_metrics["auc"],
-                )
-            )
+            print("Epoch {:04d} | train loss {:.4f} auc {:.4f} | valid loss {:.4f} auc {:.4f} pr_auc {:.4f} f1 {:.4f} | test auc {:.4f}".format(epoch, train_metrics["loss"], train_metrics["auc"], valid_metrics["loss"], valid_metrics["auc"], valid_metrics["pr_auc"], valid_metrics["f1"], test_metrics["auc"]))
         if args.patience > 0 and bad_epochs >= args.patience:
             print("Early stopping at epoch {}.".format(epoch))
             break
