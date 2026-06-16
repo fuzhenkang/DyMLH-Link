@@ -6,10 +6,9 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from dymlh_link.data import load_dynamic_link_data, move_snapshots_to_device, sample_negative_edges
-from dymlh_link.metrics import binary_metrics
+from dymlh_link.metrics import compute_metrics, link_loss
 from dymlh_link.model import DynamicHomogeneousLinkPredictor
 
 
@@ -70,13 +69,13 @@ def run_split(model, snapshots, data, pos_edges, ratio, device, optimizer=None):
     model.train(is_train)
     edges, labels = make_batch(pos_edges, data, ratio, device)
     with torch.set_grad_enabled(is_train):
-        logits = model(snapshots, edges)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        scores = model(snapshots, edges)
+        loss = link_loss(scores, labels)
         if is_train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-    metrics = binary_metrics(logits, labels)
+    metrics = compute_metrics(scores, labels)
     metrics["loss"] = float(loss.detach().cpu())
     return metrics
 
