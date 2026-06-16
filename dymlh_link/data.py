@@ -92,6 +92,13 @@ def _target_edges(graph, target_global_nids, mask):
     return torch.stack([src_compact, dst_compact], dim=0)
 
 
+def _edge_set(graph, compact_global_nids):
+    src, dst = graph.edges()
+    src_global = compact_global_nids[src.cpu()]
+    dst_global = compact_global_nids[dst.cpu()]
+    return set(zip(src_global.tolist(), dst_global.tolist()))
+
+
 def load_dynamic_link_data(args):
     snapshot_paths = _split_paths(args.snapshot_bins)
     if not snapshot_paths:
@@ -132,10 +139,9 @@ def load_dynamic_link_data(args):
     valid_edges = _target_edges(target_graph, target_global_nids, _edge_mask(target_graph, "valid"))
     test_edges = _target_edges(target_graph, target_global_nids, _edge_mask(target_graph, "test"))
 
-    src, dst = target_graph.edges()
-    src_global = target_global_nids[src.cpu()]
-    dst_global = target_global_nids[dst.cpu()]
-    all_positive = set(zip(src_global.tolist(), dst_global.tolist()))
+    all_positive = _edge_set(target_graph, target_global_nids)
+    for snapshot in snapshots:
+        all_positive |= _edge_set(snapshot.graph, snapshot.global_nids)
     if args.undirected:
         all_positive |= set((dst, src) for src, dst in all_positive)
 
