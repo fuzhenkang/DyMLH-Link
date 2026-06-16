@@ -1,51 +1,65 @@
 # DyMLH-Link
 
-Snapshot-based dynamic homogeneous link prediction.
+Snapshot-based dynamic multilayer link prediction.
 
-The training logic follows this setting:
+The intended task is:
 
 ```text
-Input snapshots: 2015, 2016, 2017, 2018, 2019
-Prediction target: 2020 links
+2015, 2016, 2017, 2018, 2019 multilayer network snapshots
+        -> predict links in one target layer of the 2020 multilayer network
 ```
 
-The historical snapshots are used only as temporal context. The target graph, for example `2020.bin`, stores the target positive edges and their `train_mask`, `valid_mask`/`val_mask`, and `test_mask`.
+Each snapshot is a DGL heterograph with one node type and multiple edge types. Each edge type represents one layer of the multilayer network:
+
+```python
+('node', 'layer_0', 'node')
+('node', 'layer_1', 'node')
+('node', 'layer_2', 'node')
+```
+
+Only the prediction target graph, for example `graph_2020.bin`, needs edge masks on the target layer:
+
+```python
+target_etype = ('node', 'layer_0', 'node')
+g.edges[target_etype].data['train_mask']
+g.edges[target_etype].data['valid_mask']
+g.edges[target_etype].data['test_mask']
+```
 
 ## Data Format
 
-Each snapshot is a homogeneous DGL graph saved by `dgl.save_graphs`.
+Historical and target snapshots should be saved with `dgl.save_graphs`.
 
-Historical snapshots:
-
-```python
-g.ndata["feat"]       # optional node features
-g.ndata["global_id"]  # optional stable node id across years
-```
-
-Target graph:
+Node data:
 
 ```python
-g.ndata["feat"]          # optional
-g.ndata["global_id"]     # optional but recommended
-g.edata["train_mask"]
-g.edata["valid_mask"]    # or g.edata["val_mask"]
-g.edata["test_mask"]
+g.nodes['node'].data['feat']
+g.nodes['node'].data['global_id']
 ```
 
-If `global_id` is not present, local node ids are used. If `feat` is not present, the loader uses `[in_degree, out_degree]` as fallback features by default.
+The `global_id` field aligns the same real node across years. Nodes may appear or disappear across snapshots.
 
 ## Model
 
-Each historical snapshot is encoded by a shared GraphSAGE encoder. Node embeddings are aligned by `global_id`, then fused across time by one temporal module:
+For every historical snapshot:
 
 ```text
-GraphSAGE(G_2015), ..., GraphSAGE(G_2019)
-        -> global node alignment
-        -> GRU / LSTM / Transformer / temporal attention
-        -> dot / DistMult / MLP link predictor for 2020
+each layer edge type -> relation-specific GraphSAGE encoder
+all layer embeddings -> layer fusion
+yearly embedding sequence -> GRU / LSTM / Transformer / temporal attention
+final node embedding -> target-layer link predictor
 ```
 
-The temporal module is controlled by:
+Layer fusion is controlled by:
+
+```text
+--layer-fusion mean
+--layer-fusion attention
+--layer-fusion weight
+--layer-fusion cat
+```
+
+Temporal fusion is controlled by:
 
 ```text
 --temporal-model gru
@@ -58,31 +72,45 @@ The temporal module is controlled by:
 
 ```bash
 python -u Link_Prediction.py \
-  --snapshot-bins data/graph_2015.bin,data/graph_2016.bin,data/graph_2017.bin,data/graph_2018.bin,data/graph_2019.bin \
-  --target-bin data/graph_2020.bin \
+  --snapshot-bins data/simulated_multilayer/graph_2015.bin,data/simulated_multilayer/graph_2016.bin,data/simulated_multilayer/graph_2017.bin,data/simulated_multilayer/graph_2018.bin,data/simulated_multilayer/graph_2019.bin \
+  --target-bin data/simulated_multilayer/graph_2020.bin \
+  --node-type node \
+  --target-layer layer_0 \
+  --use-layers layer_0,layer_1,layer_2 \
   --feat-key feat \
   --global-id-key global_id \
   --hidden-dim 128 \
   --gnn-layers 2 \
   --sage-aggregator-type mean \
+  --layer-fusion attention \
   --temporal-model gru \
   --temporal-layers 1 \
   --predictor dot \
   --negative-ratio 1.0 \
   --eval-negative-ratio 1.0 \
+  --negative-exclude-layers target \
   --epochs 500 \
   --patience 50 \
   --early-stop-metric auc \
   --log-every 10 \
-  --output-dir outputs
+  --output-dir outputs \
+  --undirected
 ```
 
-For ablation experiments, change only the temporal module:
+`--negative-exclude-layers target` excludes target-layer positive edges from all years during negative sampling. Use `--negative-exclude-layers all` if any edge in any used layer should prevent a node pair from being sampled as negative.
 
-```bash
---temporal-model lstm
---temporal-model transformer --temporal-heads 4 --temporal-layers 2
---temporal-model attention
+## Simulated Data
+
+Run:
+
+```text
+generate_simulated_data.ipynb
+```
+
+It creates dynamic multilayer heterographs under:
+
+```text
+data/simulated_multilayer/
 ```
 
 ## Outputs
