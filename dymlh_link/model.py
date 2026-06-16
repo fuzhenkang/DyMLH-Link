@@ -3,34 +3,123 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _import_sageconv():
-    try:
-        from dgl.nn import SAGEConv
-    except ImportError as exc:
-        raise ImportError("DGL with dgl.nn.SAGEConv is required.") from exc
-    return SAGEConv
+def _etype_key(etype):
+    return "homogeneous" if etype is None else "__".join(etype)
 
 
-class SnapshotGraphSAGEEncoder(nn.Module):
+class RelationGraphSAGELayer(nn.Module):
+    def __init__(self, in_dim, out_dim, aggregator_type="mean", dropout=0.0):
+        super().__init__()
+        if aggregator_type not in {"mean", "pool", "lstm", "gcn"}:
+            raise ValueError("aggregator_type must be mean, pool, lstm, or gcn")
+        self.aggregator_type = aggregator_type
+        self.dropout = dropout
+        self.fc_self = nn.Linear(in_dim, out_dim)
+        self.fc_neigh = nn.Linear(in_dim, out_dim)
+        self.fc_gcn = nn.Linear(in_dim, out_dim)
+        if aggregator_type == "pool":
+            self.fc_pool = nn.Linear(in_dim, in_dim)
+        if aggregator_type == "lstm":
+            self.lstm = nn.LSTM(in_dim, in_dim, batch_first=True)
+
+    def _aggregate_one_relation(self, graph, ntype, etype, features, message_features, reducer):
+        import dgl.function as fn
+        if etype is not None and etype not in graph.canonical_etypes:
+            return features.new_zeros(features.shape)
+        with graph.local_scope():
+            reduce_func = fn.max("m", "h_sage_neigh") if reducer == "max" else fn.mean("m", "h_sage_neigh")
+            if ntype is None:
+                graph.ndata["h_sage_src"] = message_features
+                graph.update_all(fn.copy_u("h_sage_src", "m"), reduce_func)
+                return graph.ndata.get("h_sage_neigh", features.new_zeros(features.shape))
+            graph.nodes[ntype].data["h_sage_src"] = message_features
+            graph.update_all(fn.copy_u("h_sage_src", "m"), reduce_func, etype=etype)
+            return graph.nodes[ntype].data.get("h_sage_neigh", features.new_zeros(features.shape))
+
+    def _aggregate(self, graph, ntype, etypes, features):
+        if self.aggregator_type == "pool":
+            message_features = F.relu(self.fc_pool(features))
+            reducer = "max"
+        else:
+            message_features = features
+            reducer = "mean"
+        outputs = [self._aggregate_one_relation(graph, ntype, etype, features, message_features, reducer) for etype in etypes]
+        if not outputs:
+            return features.new_zeros(features.shape)
+        if self.aggregator_type == "lstm":
+            sequence = torch.stack(outputs, dim=1)
+            _out, (hidden, _cell) = self.lstm(sequence)
+            return hidden[-1]
+        return torch.mean(torch.stack(outputs), dim=0)
+
+    def forward(self, graph, ntype, etypes, features):
+        features = features.float()
+        neigh = self._aggregate(graph, ntype, etypes, features)
+        if self.aggregator_type == "gcn":
+            h = self.fc_gcn((features + neigh) * 0.5)
+        else:
+            h = self.fc_self(features) + self.fc_neigh(neigh)
+        return F.dropout(F.relu(h), self.dropout, training=self.training)
+
+
+class RelationGraphSAGEEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers=2, aggregator_type="mean", dropout=0.5):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
-        SAGEConv = _import_sageconv()
         self.layers = nn.ModuleList()
         for layer_idx in range(num_layers):
             in_dim = input_dim if layer_idx == 0 else hidden_dim
-            self.layers.append(SAGEConv(in_dim, hidden_dim, aggregator_type))
+            self.layers.append(RelationGraphSAGELayer(in_dim, hidden_dim, aggregator_type, dropout))
+
+    def forward(self, graph, ntype, etypes, features):
+        h = features
+        for layer in self.layers:
+            h = layer(graph, ntype, etypes, h)
+        return h
+
+
+class LayerFusion(nn.Module):
+    def __init__(self, num_layers, hidden_dim, fusion_type="attention", dropout=0.0):
+        super().__init__()
+        if fusion_type not in {"mean", "attention", "weight", "cat"}:
+            raise ValueError("layer_fusion must be mean, attention, weight, or cat")
+        self.fusion_type = fusion_type
+        if fusion_type == "attention":
+            self.attn = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1, bias=False))
+        elif fusion_type == "weight":
+            self.weight = nn.Parameter(torch.full((num_layers,), 1.0 / max(1, num_layers)))
+        elif fusion_type == "cat":
+            self.linear = nn.Linear(num_layers * hidden_dim, hidden_dim)
         self.dropout = dropout
 
+    def forward(self, h_list):
+        if len(h_list) == 1:
+            return h_list[0]
+        stacked = torch.stack(h_list, dim=1)
+        if self.fusion_type == "mean":
+            return torch.mean(stacked, dim=1)
+        if self.fusion_type == "weight":
+            weight = torch.softmax(self.weight, dim=0)
+            return torch.sum(stacked * weight.view(1, -1, 1), dim=1)
+        if self.fusion_type == "cat":
+            return F.relu(self.linear(torch.flatten(stacked, start_dim=1)))
+        alpha = torch.softmax(self.attn(stacked).squeeze(-1), dim=1)
+        alpha = F.dropout(alpha, self.dropout, training=self.training)
+        return torch.sum(stacked * alpha.unsqueeze(-1), dim=1)
+
+
+class MultilayerSnapshotEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layer_etypes, node_type, num_layers=2, aggregator_type="mean", layer_fusion="attention", dropout=0.5):
+        super().__init__()
+        self.layer_etypes = layer_etypes
+        self.node_type = node_type
+        self.encoders = nn.ModuleDict({_etype_key(etype): RelationGraphSAGEEncoder(input_dim, hidden_dim, num_layers, aggregator_type, dropout) for etype in layer_etypes})
+        self.fusion = LayerFusion(len(layer_etypes), hidden_dim, layer_fusion, dropout)
+
     def forward(self, graph, features):
-        h = features.float()
-        for idx, layer in enumerate(self.layers):
-            h = layer(graph, h)
-            if idx < len(self.layers) - 1:
-                h = F.relu(h)
-                h = F.dropout(h, self.dropout, training=self.training)
-        return h
+        h_list = [self.encoders[_etype_key(etype)](graph, self.node_type, [etype], features) for etype in self.layer_etypes]
+        return self.fusion(h_list)
 
 
 class TemporalAttention(nn.Module):
@@ -40,12 +129,10 @@ class TemporalAttention(nn.Module):
         self.dropout = dropout
 
     def forward(self, sequence, presence_mask):
-        scores = self.score(sequence).squeeze(-1)
-        scores = scores.masked_fill(~presence_mask, -1e9)
+        scores = self.score(sequence).squeeze(-1).masked_fill(~presence_mask, -1e9)
         weights = torch.softmax(scores, dim=1)
         weights = torch.where(presence_mask, weights, torch.zeros_like(weights))
-        denom = weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        weights = F.dropout(weights / denom, self.dropout, training=self.training)
+        weights = F.dropout(weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12), self.dropout, training=self.training)
         return torch.sum(sequence * weights.unsqueeze(-1), dim=1)
 
 
@@ -58,13 +145,7 @@ class TemporalEncoder(nn.Module):
         elif temporal_model == "lstm":
             self.encoder = nn.LSTM(hidden_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
         elif temporal_model == "transformer":
-            layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=hidden_dim * 4,
-                dropout=dropout,
-                batch_first=True,
-            )
+            layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4, dropout=dropout, batch_first=True)
             self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
             self.position = nn.Parameter(torch.zeros(1, max_snapshots, hidden_dim))
             nn.init.normal_(self.position, std=0.02)
@@ -97,38 +178,19 @@ class TemporalEncoder(nn.Module):
         return self.encoder(sequence, presence_mask)
 
 
-class DynamicHomogeneousLinkPredictor(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        hidden_dim,
-        num_global_nodes,
-        gnn_layers=2,
-        sage_aggregator_type="mean",
-        temporal_model="gru",
-        temporal_layers=1,
-        temporal_heads=4,
-        dropout=0.5,
-        predictor="dot",
-        predictor_hidden_dim=None,
-        max_snapshots=64,
-    ):
+class DynamicMultilayerLinkPredictor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_global_nodes, layer_etypes, node_type, gnn_layers=2, sage_aggregator_type="mean", layer_fusion="attention", temporal_model="gru", temporal_layers=1, temporal_heads=4, dropout=0.5, predictor="dot", predictor_hidden_dim=None, max_snapshots=64):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_global_nodes = num_global_nodes
-        self.snapshot_encoder = SnapshotGraphSAGEEncoder(input_dim, hidden_dim, gnn_layers, sage_aggregator_type, dropout)
+        self.snapshot_encoder = MultilayerSnapshotEncoder(input_dim, hidden_dim, layer_etypes, node_type, gnn_layers, sage_aggregator_type, layer_fusion, dropout)
         self.temporal_encoder = TemporalEncoder(hidden_dim, temporal_model, temporal_layers, temporal_heads, dropout, max_snapshots)
         self.predictor = predictor
         if predictor == "distmult":
             self.relation = nn.Parameter(torch.ones(hidden_dim))
         elif predictor == "mlp":
             inner_dim = predictor_hidden_dim or hidden_dim
-            self.edge_mlp = nn.Sequential(
-                nn.Linear(hidden_dim * 4, inner_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(inner_dim, 1),
-            )
+            self.edge_mlp = nn.Sequential(nn.Linear(hidden_dim * 4, inner_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(inner_dim, 1))
         elif predictor != "dot":
             raise ValueError("predictor must be dot, distmult, or mlp")
 
@@ -144,9 +206,7 @@ class DynamicHomogeneousLinkPredictor(nn.Module):
             mask[snapshot.global_nids] = True
             sequence.append(global_h)
             masks.append(mask)
-        sequence = torch.stack(sequence, dim=1)
-        presence_mask = torch.stack(masks, dim=1)
-        return self.temporal_encoder(sequence, presence_mask)
+        return self.temporal_encoder(torch.stack(sequence, dim=1), torch.stack(masks, dim=1))
 
     def score_edges(self, node_embeddings, edges):
         src_h = node_embeddings[edges[0]]
@@ -159,5 +219,4 @@ class DynamicHomogeneousLinkPredictor(nn.Module):
         return torch.sum(F.normalize(src_h, p=2, dim=1) * F.normalize(dst_h, p=2, dim=1), dim=1)
 
     def forward(self, snapshots, edges):
-        node_embeddings = self.encode(snapshots)
-        return self.score_edges(node_embeddings, edges)
+        return self.score_edges(self.encode(snapshots), edges)
