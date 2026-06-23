@@ -22,8 +22,9 @@ class DynamicLinkData:
     train_pos_edges: torch.Tensor
     valid_pos_edges: torch.Tensor
     test_pos_edges: torch.Tensor
-    all_positive_edges: set
-    undirected: bool
+    train_neg_edges: torch.Tensor
+    valid_neg_edges: torch.Tensor
+    test_neg_edges: torch.Tensor
 
 
 def _import_dgl():
@@ -40,10 +41,10 @@ def _split_paths(value):
 
 def _load_one_graph(path, graph_index):
     dgl = _import_dgl()
-    graphs, _metadata = dgl.load_graphs(path)
+    graphs, metadata = dgl.load_graphs(path)
     if graph_index >= len(graphs):
         raise IndexError("{} contains {} graph(s), but graph_index={} was requested".format(path, len(graphs), graph_index))
-    return graphs[graph_index]
+    return graphs[graph_index], metadata
 
 
 def _resolve_target_etype(graph, spec):
@@ -119,28 +120,30 @@ def _masked_edges(graph, etype, compact_global_nids, mask):
     return torch.stack([src_compact, dst_compact], dim=0)
 
 
-def _edge_set(graph, etype, compact_global_nids):
-    src_type, rel_type, dst_type = etype
-    if etype not in graph.canonical_etypes:
-        return set()
-    src, dst = graph.edges(etype=etype)
-    src_global = compact_global_nids[src_type][src.cpu()]
-    dst_global = compact_global_nids[dst_type][dst.cpu()]
-    return set((src_type, int(s), rel_type, dst_type, int(d)) for s, d in zip(src_global.tolist(), dst_global.tolist()))
-
-
-def _positive_exclusion_set(target_graph, target_etype, snapshots, target_global_nids, mode):
-    all_positive = _edge_set(target_graph, target_etype, target_global_nids)
-    if mode == "all":
-        for etype in target_graph.canonical_etypes:
-            all_positive |= _edge_set(target_graph, etype, target_global_nids)
-    for snapshot in snapshots:
-        if mode == "target":
-            all_positive |= _edge_set(snapshot.graph, target_etype, snapshot.global_nids)
-        else:
-            for etype in snapshot.graph.canonical_etypes:
-                all_positive |= _edge_set(snapshot.graph, etype, snapshot.global_nids)
-    return all_positive
+def _stored_negative_edges(metadata, split, target_etype, target_global_nids):
+    src_key = "{}_neg_src".format(split)
+    dst_key = "{}_neg_dst".format(split)
+    if src_key not in metadata or dst_key not in metadata:
+        raise KeyError(
+            "Target bin metadata must contain '{}' and '{}'. Regenerate the bin file with fixed negatives.".format(
+                src_key, dst_key
+            )
+        )
+    src_type, _relation, dst_type = target_etype
+    src_local = metadata[src_key].long().view(-1).cpu()
+    dst_local = metadata[dst_key].long().view(-1).cpu()
+    if src_local.numel() != dst_local.numel():
+        raise ValueError("{} and {} must have the same length".format(src_key, dst_key))
+    if src_local.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long)
+    if int(src_local.min()) < 0 or int(src_local.max()) >= target_global_nids[src_type].numel():
+        raise ValueError("{} contains node ids outside target node type '{}'".format(src_key, src_type))
+    if int(dst_local.min()) < 0 or int(dst_local.max()) >= target_global_nids[dst_type].numel():
+        raise ValueError("{} contains node ids outside target node type '{}'".format(dst_key, dst_type))
+    return torch.stack([
+        target_global_nids[src_type][src_local],
+        target_global_nids[dst_type][dst_local],
+    ], dim=0)
 
 
 def _compact_global_ids(raw_snapshots, target_snapshot):
@@ -174,8 +177,8 @@ def load_dynamic_link_data(args):
     if not snapshot_paths:
         raise ValueError("--snapshot-bins must contain at least one path")
 
-    raw_graphs = [_load_one_graph(path, args.graph_index) for path in snapshot_paths]
-    target_graph = _load_one_graph(args.target_bin, args.target_graph_index)
+    raw_graphs = [_load_one_graph(path, args.graph_index)[0] for path in snapshot_paths]
+    target_graph, target_metadata = _load_one_graph(args.target_bin, args.target_graph_index)
     target_spec = getattr(args, "target_etype", None) or getattr(args, "target_layer", None)
     target_etype = _resolve_target_etype(target_graph, target_spec)
 
@@ -203,17 +206,9 @@ def load_dynamic_link_data(args):
     train_edges = _masked_edges(target_graph, target_etype, target_global_nids, _edge_mask(target_graph, target_etype, "train"))
     valid_edges = _masked_edges(target_graph, target_etype, target_global_nids, _edge_mask(target_graph, target_etype, "valid"))
     test_edges = _masked_edges(target_graph, target_etype, target_global_nids, _edge_mask(target_graph, target_etype, "test"))
-
-    all_positive = _positive_exclusion_set(
-        target_graph,
-        target_etype,
-        snapshots,
-        target_global_nids,
-        args.negative_exclude_layers,
-    )
-    if args.undirected and target_etype[0] == target_etype[2]:
-        src_type, rel_type, dst_type = target_etype
-        all_positive |= set((dst_type, dst, rel_type, src_type, src) for _s_t, src, _rel, _d_t, dst in all_positive)
+    train_neg_edges = _stored_negative_edges(target_metadata, "train", target_etype, target_global_nids)
+    valid_neg_edges = _stored_negative_edges(target_metadata, "valid", target_etype, target_global_nids)
+    test_neg_edges = _stored_negative_edges(target_metadata, "test", target_etype, target_global_nids)
 
     return DynamicLinkData(
         snapshots=snapshots,
@@ -225,8 +220,9 @@ def load_dynamic_link_data(args):
         train_pos_edges=train_edges,
         valid_pos_edges=valid_edges,
         test_pos_edges=test_edges,
-        all_positive_edges=all_positive,
-        undirected=args.undirected,
+        train_neg_edges=train_neg_edges,
+        valid_neg_edges=valid_neg_edges,
+        test_neg_edges=test_neg_edges,
     )
 
 
@@ -242,30 +238,3 @@ def move_snapshots_to_device(snapshots, device):
             )
         )
     return output
-
-
-def sample_negative_edges(pos_edges, num_nodes, positive_edge_set, target_etype, negative_ratio=1.0, undirected=False, device=None):
-    src_type, rel_type, dst_type = target_etype
-    num_pos = pos_edges.shape[1]
-    num_neg = max(1, int(num_pos * negative_ratio))
-    src_pos = pos_edges[0].detach().cpu()
-    neg_src = []
-    neg_dst = []
-    while len(neg_src) < num_neg:
-        batch_size = max(num_neg - len(neg_src), 1024)
-        src = src_pos[torch.randint(0, num_pos, (batch_size,))]
-        dst = torch.randint(0, num_nodes, (batch_size,))
-        for s, d in zip(src.tolist(), dst.tolist()):
-            if src_type == dst_type and s == d:
-                continue
-            key = (src_type, s, rel_type, dst_type, d)
-            if key in positive_edge_set:
-                continue
-            if undirected and (dst_type, d, rel_type, src_type, s) in positive_edge_set:
-                continue
-            neg_src.append(s)
-            neg_dst.append(d)
-            if len(neg_src) >= num_neg:
-                break
-    edges = torch.tensor([neg_src, neg_dst], dtype=torch.long)
-    return edges.to(device) if device is not None else edges

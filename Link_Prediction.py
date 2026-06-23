@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 
-from dymlh_link.data import load_dynamic_link_data, move_snapshots_to_device, sample_negative_edges
+from dymlh_link.data import load_dynamic_link_data, move_snapshots_to_device
 from dymlh_link.metrics import compute_metrics, link_loss
 from dymlh_link.model import DynamicMCCELinkPredictor
 
@@ -85,7 +85,6 @@ def build_parser():
     parser.add_argument("--feat-key", type=str, default="feat")
     parser.add_argument("--global-id-key", type=str, default="global_id")
     parser.add_argument("--feature-fallback", type=str, default="degree", choices=["degree", "none"])
-    parser.add_argument("--undirected", action="store_true", default=False, help="Treat homogeneous positive target edges as undirected during negative sampling.")
     parser.add_argument("--no-cuda", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=200)
@@ -111,9 +110,6 @@ def build_parser():
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--predictor", type=str, default="distmult", choices=["dot", "distmult", "mlp"])
     parser.add_argument("--predictor-hidden-dim", type=int, default=None)
-    parser.add_argument("--negative-ratio", type=float, default=1.0)
-    parser.add_argument("--eval-negative-ratio", type=float, default=1.0)
-    parser.add_argument("--negative-exclude-layers", type=str, default="target", choices=["target", "all"], help="Exclude positives from target relation only or all relations when sampling negatives.")
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--early-stop-metric", type=str, default="auc", choices=["auc", "pr_auc", "f1"])
     parser.add_argument("--log-every", type=int, default=10)
@@ -122,18 +118,9 @@ def build_parser():
     return parser
 
 
-def make_batch(pos_edges, data, ratio, device):
-    dst_type = data.target_etype[2]
-    neg_edges = sample_negative_edges(
-        pos_edges,
-        data.num_global_nodes[dst_type],
-        data.all_positive_edges,
-        data.target_etype,
-        negative_ratio=ratio,
-        undirected=data.undirected,
-        device=device,
-    )
+def make_batch(pos_edges, neg_edges, device):
     pos_edges = pos_edges.to(device)
+    neg_edges = neg_edges.to(device)
     edges = torch.cat([pos_edges, neg_edges], dim=1)
     labels = torch.cat([
         torch.ones(pos_edges.shape[1], device=device),
@@ -142,10 +129,10 @@ def make_batch(pos_edges, data, ratio, device):
     return edges, labels
 
 
-def run_split(model, snapshots, data, pos_edges, ratio, device, optimizer=None):
+def run_split(model, snapshots, pos_edges, neg_edges, device, optimizer=None):
     is_train = optimizer is not None
     model.train(is_train)
-    edges, labels = make_batch(pos_edges, data, ratio, device)
+    edges, labels = make_batch(pos_edges, neg_edges, device)
     with torch.set_grad_enabled(is_train):
         scores = model(snapshots, edges)
         loss = link_loss(scores, labels)
@@ -234,6 +221,9 @@ def main():
     print("Train/valid/test positives: {}/{}/{}".format(
         data.train_pos_edges.shape[1], data.valid_pos_edges.shape[1], data.test_pos_edges.shape[1]
     ))
+    print("Train/valid/test fixed negatives: {}/{}/{}".format(
+        data.train_neg_edges.shape[1], data.valid_neg_edges.shape[1], data.test_neg_edges.shape[1]
+    ))
     print("Temporal model: {}".format(args.temporal_model))
 
     records = []
@@ -242,9 +232,15 @@ def main():
     best_test = None
     bad_epochs = 0
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_split(model, snapshots, data, data.train_pos_edges, args.negative_ratio, device, optimizer)
-        valid_metrics = run_split(model, snapshots, data, data.valid_pos_edges, args.eval_negative_ratio, device)
-        test_metrics = run_split(model, snapshots, data, data.test_pos_edges, args.eval_negative_ratio, device)
+        train_metrics = run_split(
+            model, snapshots, data.train_pos_edges, data.train_neg_edges, device, optimizer
+        )
+        valid_metrics = run_split(
+            model, snapshots, data.valid_pos_edges, data.valid_neg_edges, device
+        )
+        test_metrics = run_split(
+            model, snapshots, data.test_pos_edges, data.test_neg_edges, device
+        )
         records.extend([
             metric_line(epoch, "train", train_metrics),
             metric_line(epoch, "valid", valid_metrics),

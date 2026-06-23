@@ -51,6 +51,19 @@ g.edges[target_etype].data['valid_mask']
 g.edges[target_etype].data['test_mask']
 ```
 
+The target-year `.bin` must also store fixed negative edge pairs in the `dgl.save_graphs` metadata:
+
+```python
+metadata['train_neg_src']
+metadata['train_neg_dst']
+metadata['valid_neg_src']
+metadata['valid_neg_dst']
+metadata['test_neg_src']
+metadata['test_neg_dst']
+```
+
+These tensors contain local node ids in the target graph. Negative pairs must be disjoint across splits and must never occur as positive target-relation edges in any historical or target year.
+
 For cross-layer prediction, the target relation can also be heterogeneous:
 
 ```python
@@ -107,15 +120,11 @@ python -u Link_Prediction.py \
   --temporal-model gru \
   --temporal-layers 1 \
   --predictor distmult \
-  --negative-ratio 1.0 \
-  --eval-negative-ratio 1.0 \
-  --negative-exclude-layers target \
   --epochs 500 \
   --patience 50 \
   --early-stop-metric auc \
   --log-every 10 \
-  --output-dir outputs \
-  --undirected
+  --output-dir outputs
 ```
 
 For cross-layer target prediction:
@@ -162,11 +171,11 @@ gru / lstm / transformer / attention
 dot / distmult / mlp
 ```
 
-## Negative Sampling
+## Fixed Negative Edges
 
-`--negative-exclude-layers target` excludes target-relation positive edges from all years.
+Training does not perform dynamic negative sampling. Train, validation, and test negatives are generated when the dataset is split and are read unchanged from target-bin metadata in every epoch.
 
-`--negative-exclude-layers all` excludes positive edges from all relations in all snapshots and the target graph.
+The simulated-data notebook builds the exclusion set from the target relation in every year, samples only node pairs that have never appeared, and assigns disjoint fixed negatives to the three splits. Existing simulated `.bin` files must be regenerated after this change.
 
 ## Outputs
 
