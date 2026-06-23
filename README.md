@@ -63,7 +63,7 @@ For each snapshot, the spatial encoder follows MCCE-MHGNN:
 
 ```text
 node features by type
-  -> intra-layer same-type GraphSAGE encoder
+  -> intra-layer same-type DGL SAGEConv encoder
   -> cross-layer metapath context encoder
   -> metapath context fusion
   -> gate/linear fusion of intra and cross-layer embeddings
@@ -85,7 +85,7 @@ author:author_to_paper:paper>paper:paper_to_author:author
 author:author_to_venue:venue>venue:venue_to_author:author
 ```
 
-Only metapaths made of heterogeneous edges are used for cross-layer context. Same-type relations such as `author:coauthor:author` are handled by the intra-layer GraphSAGE encoder.
+Only metapaths made of heterogeneous edges are used for cross-layer context. Same-type relations such as `author:coauthor:author` are handled by the intra-layer encoder implemented with DGL `SAGEConv`. For a node type with multiple same-type relations, the same `SAGEConv` layer is applied to each relation and the relation outputs are averaged. Node types without same-type relations use a learned self-only projection.
 
 ## Training Command
 
@@ -126,7 +126,7 @@ For cross-layer target prediction:
 
 ## Important Parameters
 
-`--gnn-layers` controls the intra-layer GraphSAGE depth.
+`--gnn-layers` controls the number of stacked intra-layer DGL `SAGEConv` layers. `--sage-aggregator-type` selects the official DGL `mean`, `pool`, `lstm`, or `gcn` aggregator.
 
 `--context-encoder` controls the MCCE cross-layer semantic encoder:
 

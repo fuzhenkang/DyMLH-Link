@@ -27,66 +27,43 @@ def _metapath_key(metapath):
     return "||".join(_etype_key(etype) for etype in metapath)
 
 
-class DGLGraphSAGELayer(nn.Module):
+class DGLSAGEConvLayer(nn.Module):
     def __init__(self, in_dim, out_dim, aggregator_type="mean", activation=F.relu, dropout=0.0, normalize=False):
         super().__init__()
         if aggregator_type not in {"mean", "pool", "lstm", "gcn"}:
             raise ValueError("aggregator_type must be one of mean, pool, lstm, or gcn")
-        self.aggregator_type = aggregator_type
+        _import_dgl()
+        from dgl.nn import SAGEConv
+
         self.activation = activation
         self.dropout = dropout
         self.normalize = normalize
-        self.fc_self = nn.Linear(in_dim, out_dim)
-        self.fc_neigh = nn.Linear(in_dim, out_dim)
-        self.fc_gcn = nn.Linear(in_dim, out_dim)
-        if aggregator_type == "pool":
-            self.fc_pool = nn.Linear(in_dim, in_dim)
-        if aggregator_type == "lstm":
-            self.lstm = nn.LSTM(in_dim, in_dim, batch_first=True)
-
-    def _relation_aggregate(self, graph, ntype, etype, features, message_features, reducer):
-        import dgl.function as fn
-
-        with graph.local_scope():
-            graph.nodes[ntype].data["h_sage_src"] = message_features
-            reduce_func = fn.max("m", "h_sage_neigh") if reducer == "max" else fn.mean("m", "h_sage_neigh")
-            graph.update_all(fn.copy_u("h_sage_src", "m"), reduce_func, etype=etype)
-            return graph.nodes[ntype].data.get("h_sage_neigh", features.new_zeros(features.shape))
-
-    def _aggregate_neighbors(self, graph, ntype, etypes, features):
-        if not etypes:
-            return features.new_zeros(features.shape)
-        if self.aggregator_type == "pool":
-            message_features = F.relu(self.fc_pool(features))
-            reducer = "max"
-        else:
-            message_features = features
-            reducer = "mean"
-        relation_outputs = [
-            self._relation_aggregate(graph, ntype, etype, features, message_features, reducer)
-            for etype in etypes
-            if etype in graph.canonical_etypes
-        ]
-        if not relation_outputs:
-            return features.new_zeros(features.shape)
-        if self.aggregator_type == "lstm":
-            sequence = torch.stack(relation_outputs, dim=1)
-            _out, (hidden, _cell) = self.lstm(sequence)
-            return hidden[-1]
-        return torch.mean(torch.stack(relation_outputs), dim=0)
+        self.conv = SAGEConv(
+            in_dim,
+            out_dim,
+            aggregator_type=aggregator_type,
+            feat_drop=dropout,
+            activation=activation,
+        )
+        self.self_only = nn.Linear(in_dim, out_dim)
 
     def forward(self, graph, ntype, etypes, features):
         features = features.float()
-        neigh = self._aggregate_neighbors(graph, ntype, etypes, features)
-        if self.aggregator_type == "gcn":
-            h = self.fc_gcn((features + neigh) * 0.5)
+        relation_outputs = []
+        for etype in etypes:
+            if etype not in graph.canonical_etypes:
+                continue
+            relation_graph = graph[etype]
+            relation_outputs.append(self.conv(relation_graph, (features, features)))
+        if relation_outputs:
+            h = torch.mean(torch.stack(relation_outputs), dim=0)
         else:
-            h = self.fc_self(features) + self.fc_neigh(neigh)
-        if self.activation is not None:
-            h = self.activation(h)
+            h = self.self_only(F.dropout(features, self.dropout, training=self.training))
+            if self.activation is not None:
+                h = self.activation(h)
         if self.normalize:
             h = F.normalize(h, p=2, dim=1)
-        return F.dropout(h, self.dropout, training=self.training)
+        return h
 
 
 class MECCHMetapathFusion(nn.Module):
@@ -231,7 +208,14 @@ class DynamicMCCESnapshotEncoder(nn.Module):
         self.intra_etypes = {ntype: [etype for etype in graph.canonical_etypes if etype[0] == ntype and etype[2] == ntype] for ntype in self.ntypes}
         self.intra_sage = nn.ModuleDict({
             ntype: nn.ModuleList([
-                DGLGraphSAGELayer(hidden_dim, hidden_dim, aggregator_type=sage_aggregator_type, activation=F.relu, dropout=dropout, normalize=sage_normalize)
+                DGLSAGEConvLayer(
+                    hidden_dim,
+                    hidden_dim,
+                    aggregator_type=sage_aggregator_type,
+                    activation=F.relu,
+                    dropout=dropout,
+                    normalize=sage_normalize,
+                )
                 for _ in range(gnn_layers)
             ])
             for ntype in self.ntypes
